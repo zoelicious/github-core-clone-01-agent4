@@ -2412,17 +2412,17 @@ class ForgeHandler(BaseHTTPRequestHandler):
             out = []
             for path in sorted(diffs):
                 change = diffs[path]
-                adds, dels = line_counts(repo.objects, change[1], change[2])
-                if change[0] == "added":
+                adds, dels = line_counts(repo.objects, change[0], change[1])
+                if change[0] is None:
                     status = "added"
-                elif change[0] == "removed":
+                elif change[1] is None:
                     status = "removed"
                 else:
                     status = "modified"
                 out.append({"filename": path, "status": status,
                             "additions": adds, "deletions": dels,
                             "changes": adds + dels,
-                            "sha": change[2] or change[1] or ""})
+                            "sha": change[1] or change[0] or ""})
             self._send_json(200, out)
             return
         if rest[1] == "merge" and method == "PUT":
@@ -2806,7 +2806,7 @@ def _pr_files_connection(repo, pr, args):
     nodes = []
     for path in sorted(diffs):
         change = diffs[path]
-        adds, dels = line_counts(repo.objects, change[1], change[2])
+        adds, dels = line_counts(repo.objects, change[0], change[1])
         nodes.append({"path": path, "additions": adds, "deletions": dels})
     first = args.get("first")
     if first is not None:
@@ -3027,7 +3027,7 @@ def _gql_field(type_name, obj, field, args, errors):
         return _MISSING
     if type_name == "IssueComment":
         if name == "id":
-            return obj["id"]
+            return str(obj["id"])
         if name == "body":
             return obj["body"]
         return _MISSING
