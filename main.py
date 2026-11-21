@@ -1605,7 +1605,10 @@ class ForgeHandler(BaseHTTPRequestHandler):
         shallow = []
         unshallow = []
         if depth is None:
-            send = reachable(objects, want_commits, stop_at=held) | extra
+            # Full closures on both sides: stop_at would still re-send
+            # objects shared with the held tip through the new tip's tree.
+            send = (reachable(objects, want_commits)
+                    - reachable(objects, list(held))) | (extra - held)
         else:
             # Window: commits within `depth` generations of the wants.
             window = set()
@@ -2081,7 +2084,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
             out.append({
                 "sha": oid,
                 "commit": {
-                    "message": commit["message"],
+                    "message": commit["message"].rstrip("\n"),
                     "author": {"name": author[0], "email": author[1],
                                "date": iso_from_epoch(author[2])},
                     "committer": {"name": committer[0],
@@ -2317,7 +2320,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
                 if not isinstance(text, str) or not text:
                     self._err(422, "Validation Failed: body is required")
                     return
-                comment = STORE.add_comment(repo, "issue", number, text)
+                comment = STORE.add_comment(repo, number, text)
                 self._send_json(201, {"id": comment["id"], "body": text,
                                       "user": {"login": VIEWER_LOGIN,
                                                "id": VIEWER_ID},
@@ -2372,8 +2375,8 @@ class ForgeHandler(BaseHTTPRequestHandler):
                             existing["base"] == base):
                         self._err(422, "A pull request already exists for this head and base")
                         return
-                pr = STORE.create_pull(repo, title, head, base,
-                                       body.get("body"))
+                pr = STORE.create_pull(repo, title, body.get("body"),
+                                       head, base)
                 self._send_json(201, pull_json(repo, pr))
                 return
             self._err(404, "Not Found")
@@ -2429,7 +2432,10 @@ class ForgeHandler(BaseHTTPRequestHandler):
             if not STORE.mergeable(repo, pr):
                 self._err(405, "Merge conflict")
                 return
-            sha = STORE.squash_merge(repo, pr)
+            ok, sha = STORE.squash_merge(repo, pr)
+            if not ok:
+                self._err(405, "Merge conflict")
+                return
             self._send_json(200, {"sha": sha, "merged": True,
                                   "message": "Pull request successfully merged"})
             return
@@ -2761,7 +2767,7 @@ def _issues_connection(repo, args):
     page = items if first is None else items[:first]
     has_next = len(items) > len(page)
     end_cursor = ("c%d" % page[-1]["number"]) if page else None
-    return {"nodes": page,
+    return {"repo": repo, "nodes": page,
             "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor}}
 
 
@@ -2783,7 +2789,7 @@ def _pulls_connection(repo, args):
     page = items if first is None else items[:first]
     has_next = len(items) > len(page)
     end_cursor = ("c%d" % page[-1]["number"]) if page else None
-    return {"nodes": page,
+    return {"repo": repo, "nodes": page,
             "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor}}
 
 
@@ -2839,7 +2845,7 @@ def _gql_repo_fields(repo, field, args, errors):
     if name == "issue":
         number = args.get("number")
         issue = repo.issues.get(number) if isinstance(number, int) else None
-        return _obj("Issue", issue) if issue is not None else None
+        return _obj("Issue", (repo, issue)) if issue is not None else None
     if name == "issues":
         return _obj("IssueConnection", _issues_connection(repo, args))
     if name == "pullRequests":
@@ -2847,7 +2853,7 @@ def _gql_repo_fields(repo, field, args, errors):
     if name == "pullRequest":
         number = args.get("number")
         pr = repo.pulls.get(number) if isinstance(number, int) else None
-        return _obj("PullRequest", pr) if pr is not None else None
+        return _obj("PullRequest", (repo, pr)) if pr is not None else None
     return _MISSING
 
 
@@ -2968,7 +2974,8 @@ def _gql_field(type_name, obj, field, args, errors):
         return _gql_pr_fields(repo, pr, field, args, errors)
     if type_name == "IssueConnection":
         if name == "nodes":
-            return _list("Issue", [(None, i) for i in obj["nodes"]])
+            return _list("Issue", [(obj.get("repo"), i)
+                                   for i in obj["nodes"]])
         if name == "pageInfo":
             return _obj("PageInfo", obj["pageInfo"])
         if name == "totalCount":
@@ -2976,7 +2983,8 @@ def _gql_field(type_name, obj, field, args, errors):
         return _MISSING
     if type_name == "PullRequestConnection":
         if name == "nodes":
-            return _list("PullRequest", [(None, p) for p in obj["nodes"]])
+            return _list("PullRequest", [(obj.get("repo"), p)
+                                         for p in obj["nodes"]])
         if name == "pageInfo":
             return _obj("PageInfo", obj["pageInfo"])
         if name == "totalCount":
@@ -3091,8 +3099,8 @@ def _gql_root(field, variables, errors):
         if repo.ref_tip(head) is None or repo.ref_tip(base) is None:
             errors.append("createPullRequest: head or base branch not found")
             return None
-        pr = STORE.create_pull(repo, inp.get("title") or "", head, base,
-                               inp.get("body"))
+        pr = STORE.create_pull(repo, inp.get("title") or "", inp.get("body"),
+                               head, base)
         return _obj("CreatePullRequestPayload", {"pullRequest": (repo, pr)})
     if name == "mergePullRequest":
         inp = args.get("input") or {}
@@ -3111,7 +3119,7 @@ def _gql_root(field, variables, errors):
             errors.append("addComment: could not resolve subjectId")
             return None
         repo, issue = resolved[1], resolved[2]
-        comment = STORE.add_comment(repo, "issue", issue["number"],
+        comment = STORE.add_comment(repo, issue["number"],
                                     inp.get("body") or "")
         return _obj("AddCommentPayload",
                     {"commentEdge": {"node": comment}})
@@ -3349,8 +3357,8 @@ def _mcp_tool_call(name, args):
         base = str(args["base"]).split(":", 1)[-1]
         if repo.ref_tip(head) is None or repo.ref_tip(base) is None:
             return None, "head or base branch does not exist"
-        pr = STORE.create_pull(repo, args["title"], head, base,
-                               args.get("body"))
+        pr = STORE.create_pull(repo, args["title"], args.get("body"),
+                               head, base)
         return pull_json(repo, pr), None
     if name == "merge_pull_request":
         number = args["pull_number"]
@@ -3361,7 +3369,9 @@ def _mcp_tool_call(name, args):
             return None, "Pull request is not open"
         if not STORE.mergeable(repo, pr):
             return None, "Merge conflict"
-        sha = STORE.squash_merge(repo, pr)
+        ok, sha = STORE.squash_merge(repo, pr)
+        if not ok:
+            return None, "Merge conflict"
         return {"sha": sha, "merged": True, "number": number,
                 "state": "closed",
                 "message": "Pull request successfully merged"}, None
