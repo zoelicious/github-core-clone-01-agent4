@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -813,8 +814,8 @@ class Repo:
         self.refs = {}          # refname -> oid
         self.objects = {}       # oid -> (type, bytes)
         self.labels = {}        # name -> {"name","color"}
-        self.issues = []        # dicts, in creation order
-        self.pulls = []         # dicts, in creation order
+        self.issues = {}        # number -> dict, in creation order
+        self.pulls = {}         # number -> dict, in creation order
         self.comments = {}      # issue number -> [comment dicts]
         self.counter = 0        # shared issue+PR number sequence
         self.seq = 0            # per-repo creation sequence
@@ -829,13 +830,13 @@ class Repo:
         return self.refs.get("refs/heads/" + branch)
 
     def issue_by_number(self, number):
-        for issue in self.issues:
+        for issue in self.issues.values():
             if issue["number"] == number:
                 return issue
         return None
 
     def pull_by_number(self, number):
-        for pr in self.pulls:
+        for pr in self.pulls.values():
             if pr["number"] == number:
                 return pr
         return None
@@ -933,7 +934,7 @@ class Store:
                                 for n in labels],
                      "global_id": "gid-issue-%d-%d" % (repo.dbid, number),
                      "seq": number}
-            repo.issues.append(issue)
+            repo.issues[number] = issue
             repo.comments[number] = []
             self.log_event("issue.create",
                            {"repo": repo.full_name(), "number": number,
@@ -958,7 +959,7 @@ class Store:
                   "merged_at": None,
                   "global_id": "gid-pr-%d-%d" % (repo.dbid, number),
                   "seq": number}
-            repo.pulls.append(pr)
+            repo.pulls[number] = pr
             self.log_event("pull.create",
                            {"repo": repo.full_name(), "number": number,
                             "title": title or "", "head": head, "base": base})
@@ -1436,6 +1437,458 @@ class ForgeHandler(BaseHTTPRequestHandler):
                 self._err(500, "Internal error: %s" % exc)
             except Exception:
                 pass
+
+    # -- git smart HTTP --------------------------------------------------
+    def _git(self, path, method, query):
+        parts = [p for p in path.split("/") if p != ""]
+        if len(parts) < 2 or not parts[1].endswith(".git"):
+            self._err(404, "Not Found")
+            return
+        owner = urllib.parse.unquote(parts[0])
+        name = urllib.parse.unquote(parts[1][:-4])
+        repo = self._load_repo(owner, name)
+        if repo is None:
+            return
+        if not self._require_auth():
+            return
+        if len(parts) == 4 and parts[2] == "info" and parts[3] == "refs":
+            if method != "GET":
+                self._err(405, "Method Not Allowed")
+                return
+            service = (query.get("service") or [None])[0]
+            self._git_info_refs(repo, service)
+            return
+        if len(parts) == 3 and parts[2] in ("git-upload-pack",
+                                            "git-receive-pack"):
+            if method != "POST":
+                self._err(405, "Method Not Allowed")
+                return
+            try:
+                if parts[2] == "git-upload-pack":
+                    self._git_upload_pack(repo)
+                else:
+                    self._git_receive_pack(repo)
+            except ValueError as exc:
+                self._err(400, "Bad git request: %s" % exc)
+            return
+        self._err(404, "Not Found")
+
+    def _git_head_ref(self, repo):
+        return "refs/heads/" + repo.default_branch
+
+    def _git_peeled(self, repo, oid):
+        obj = repo.objects.get(oid)
+        if obj is not None and obj[0] == "tag":
+            return parse_tag(obj[1])["object"]
+        return None
+
+    def _git_v0_advertisement(self, repo, service):
+        if service == "git-receive-pack":
+            caps = ("report-status side-band-64k delete-refs ofs-delta "
+                    "agent=Forge/1.0")
+        else:
+            caps = ("symref=HEAD:%s side-band-64k thin-pack ofs-delta "
+                    "shallow multi_ack agent=Forge/1.0" %
+                    self._git_head_ref(repo))
+        out = [pkt_line("# service=%s\n" % service), pkt_flush()]
+        with STORE.lock:
+            refs = sorted(repo.refs.items())
+        if not refs:
+            out.append(pkt_line("%s capabilities^{}\x00%s\n" %
+                                (ZERO_OID, caps)))
+        else:
+            with STORE.lock:
+                head_oid = repo.refs.get(self._git_head_ref(repo), ZERO_OID)
+            out.append(pkt_line("%s HEAD\x00%s\n" % (head_oid, caps)))
+            for name, oid in refs:
+                out.append(pkt_line("%s %s\n" % (oid, name)))
+                peeled = self._git_peeled(repo, oid)
+                if peeled:
+                    out.append(pkt_line("%s %s^{}\n" % (peeled, name)))
+        out.append(pkt_flush())
+        return b"".join(out)
+
+    def _git_v2_advertisement(self):
+        return b"".join([
+            pkt_line("# service=git-upload-pack\n"), pkt_flush(),
+            pkt_line("version 2\n"),
+            pkt_line("ls-refs=unborn\n"),
+            pkt_line("fetch=shallow\n"),
+            pkt_line("agent=Forge/1.0\n"),
+            pkt_line("object-format=sha1\n"),
+            pkt_flush()])
+
+    def _git_info_refs(self, repo, service):
+        if service == "git-upload-pack":
+            if (self.headers.get("Git-Protocol") or "") == "version=2":
+                body = self._git_v2_advertisement()
+            else:
+                body = self._git_v0_advertisement(repo, service)
+            self._send(200, body,
+                       "application/x-git-upload-pack-advertisement")
+        elif service == "git-receive-pack":
+            body = self._git_v0_advertisement(repo, service)
+            self._send(200, body,
+                       "application/x-git-receive-pack-advertisement")
+        else:
+            self._err(404, "Not Found")
+
+    def _git_ls_refs(self, repo, args):
+        peel = "peel" in args
+        symrefs = "symrefs" in args
+        unborn = "unborn" in args
+        prefixes = [a[len("ref-prefix "):] for a in args
+                    if a.startswith("ref-prefix ")]
+        head_ref = self._git_head_ref(repo)
+        with STORE.lock:
+            refs = sorted(repo.refs.items())
+            head_oid = repo.refs.get(head_ref)
+
+        def keep(name):
+            return not prefixes or any(name.startswith(p) for p in prefixes)
+
+        lines = []
+        if head_oid is None:
+            if keep("HEAD") and unborn:
+                line = "unborn HEAD"
+                if symrefs:
+                    line += " symref-target:%s" % head_ref
+                lines.append(line + "\n")
+        else:
+            if keep("HEAD"):
+                line = "%s HEAD" % head_oid
+                if symrefs:
+                    line += " symref-target:%s" % head_ref
+                lines.append(line + "\n")
+        for name, oid in refs:
+            if not keep(name):
+                continue
+            line = "%s %s" % (oid, name)
+            if peel:
+                peeled = self._git_peeled(repo, oid)
+                if peeled:
+                    line += " peeled:%s" % peeled
+            lines.append(line + "\n")
+        body = b"".join(pkt_line(l) for l in lines) + pkt_flush()
+        self._send(200, body, "application/x-git-upload-pack-result")
+
+    def _git_fetch_plan(self, objects, wants, haves, depth, shallow_old):
+        """Plan a fetch over a snapshot objects dict.
+
+        Returns (send_oids, ack_or_None, shallow, unshallow). send_oids are
+        the objects to pack; ack is a have the server shares with the client.
+        """
+        held = set(h for h in haves if h in objects)
+        want_commits = []
+        extra = set()
+        for w in wants:
+            obj = objects.get(w)
+            if obj is None:
+                continue
+            if obj[0] == "commit":
+                want_commits.append(w)
+            elif obj[0] == "tag":
+                extra.add(w)
+                target = parse_tag(obj[1])["object"]
+                if objects.get(target, (None,))[0] == "commit":
+                    want_commits.append(target)
+            else:
+                extra.add(w)
+        ack = None
+        for h in haves:
+            if h not in objects:
+                continue
+            if any(h == w or is_ancestor(objects, h, w)
+                   for w in want_commits):
+                ack = h
+                break
+        shallow = []
+        unshallow = []
+        if depth is None:
+            send = reachable(objects, want_commits, stop_at=held) | extra
+        else:
+            # Window: commits within `depth` generations of the wants.
+            window = set()
+            level = list(want_commits)
+            seen = set(level)
+            for _ in range(depth):
+                window |= set(level)
+                nxt = []
+                for c in level:
+                    obj = objects.get(c)
+                    if obj is None or obj[0] != "commit":
+                        continue
+                    for p in parse_commit(obj[1])["parents"]:
+                        if p in seen:
+                            continue
+                        if objects.get(p, (None,))[0] != "commit":
+                            continue
+                        seen.add(p)
+                        nxt.append(p)
+                level = nxt
+            boundary = set()
+            for c in window:
+                obj = objects.get(c)
+                parents = (parse_commit(obj[1])["parents"]
+                           if obj is not None and obj[0] == "commit" else [])
+                if not any(p in window for p in parents):
+                    boundary.add(c)
+            send = set(extra)
+            for c in window:
+                send.add(c)
+                obj = objects.get(c)
+                if obj is not None and obj[0] == "commit":
+                    tree = parse_commit(obj[1])["tree"]
+                    send |= reachable(objects, [tree])
+            # The client already holds each have's own commit+tree, not its
+            # ancestry (a shallow boundary holds no parents).
+            held_exact = set()
+            for h in held:
+                held_exact.add(h)
+                obj = objects.get(h)
+                if obj is not None and obj[0] == "commit":
+                    held_exact |= reachable(
+                        objects, [parse_commit(obj[1])["tree"]])
+            send -= held_exact
+            shallow = sorted(boundary)
+            unshallow = sorted(b for b in shallow_old
+                               if b in window and b not in boundary)
+        return send, ack, shallow, unshallow
+
+    def _git_sideband(self, data, band=1):
+        if not data:
+            return b""
+        out = []
+        step = PKT_MAX - 5
+        for i in range(0, len(data), step):
+            out.append(pkt_line(bytes([band]) + data[i:i + step]))
+        return b"".join(out)
+
+    def _git_fetch(self, repo, args, v2):
+        wants = []
+        haves = []
+        shallow_old = []
+        depth = None
+        done = False
+        for a in args:
+            if a.startswith("want "):
+                wants.append(a[5:].split(" ")[0])
+            elif a.startswith("have "):
+                haves.append(a[5:].strip())
+            elif a.startswith("shallow "):
+                shallow_old.append(a[8:].strip())
+            elif a.startswith("deepen "):
+                try:
+                    depth = int(a[7:].strip())
+                except ValueError:
+                    depth = None
+            elif a == "done":
+                done = True
+        with STORE.lock:
+            objects = dict(repo.objects)
+        send, ack, shallow, unshallow = self._git_fetch_plan(
+            objects, wants, haves, depth, shallow_old)
+        pack = write_pack([(oid, objects[oid][0], objects[oid][1])
+                           for oid in sorted(send) if oid in objects])
+        if v2:
+            # protocol-v2: when the client sent "done" it has finished
+            # negotiating, so the acknowledgments section MUST be omitted
+            # and the response goes straight to shallow-info / packfile.
+            # Without "done" the ack section is sent; without "ready" the
+            # response ends there (flush, no packfile).
+            out = []
+            if not done:
+                out.append(pkt_line("acknowledgments\n"))
+                if ack is not None:
+                    out.append(pkt_line("ACK %s\n" % ack))
+                    out.append(pkt_line("ready\n"))
+                    out.append(pkt_delim())
+                else:
+                    out.append(pkt_line("NAK\n"))
+                    out.append(pkt_flush())
+                    self._send(200, b"".join(out),
+                               "application/x-git-upload-pack-result")
+                    return
+            if depth is not None or unshallow:
+                out.append(pkt_line("shallow-info\n"))
+                for oid in shallow:
+                    out.append(pkt_line("shallow %s\n" % oid))
+                for oid in unshallow:
+                    out.append(pkt_line("unshallow %s\n" % oid))
+                out.append(pkt_delim())
+            out.append(pkt_line("packfile\n"))
+            out.append(self._git_sideband(pack, 1))
+            out.append(pkt_flush())
+        else:
+            out = []
+            if ack is not None:
+                out.append(pkt_line("ACK %s\n" % ack))
+            else:
+                out.append(pkt_line("NAK\n"))
+            for oid in shallow:
+                out.append(pkt_line("shallow %s\n" % oid))
+            for oid in unshallow:
+                out.append(pkt_line("unshallow %s\n" % oid))
+            out.append(self._git_sideband(pack, 1))
+            out.append(pkt_flush())
+        self._send(200, b"".join(out),
+                   "application/x-git-upload-pack-result")
+
+    def _git_upload_pack(self, repo):
+        body = self._raw_body
+        packets = decode_pkt_lines(body)
+        lines = pkt_lines_text(packets)
+        v2 = (self.headers.get("Git-Protocol") or "") == "version=2"
+        if v2:
+            if not lines or not lines[0].startswith("command="):
+                raise ValueError("missing command")
+            command = lines[0][len("command="):].strip()
+            # Args follow the delim packet.
+            args = []
+            seen_delim = False
+            for kind, payload in packets:
+                if kind == "delim":
+                    seen_delim = True
+                    continue
+                if seen_delim and kind == "data":
+                    args.append(payload.decode("utf-8", "replace")
+                                .rstrip("\n"))
+            if command == "ls-refs":
+                self._git_ls_refs(repo, args)
+            elif command == "fetch":
+                self._git_fetch(repo, args, True)
+            else:
+                raise ValueError("unknown command %r" % command)
+        else:
+            # v0 fetch: want/have lines in two flush-separated sections.
+            args = [l.rstrip("\n") for l in lines]
+            if not any(a.startswith("want ") for a in args):
+                raise ValueError("missing want")
+            self._git_fetch(repo, args, False)
+
+    def _git_receive_pack(self, repo):
+        body = self._raw_body
+        # Split the command list (pkt-lines up to the first flush) from the
+        # pack that follows it.
+        off = 0
+        commands = []
+        pack_start = None
+        n = len(body)
+        while off + 4 <= n:
+            head = body[off:off + 4]
+            if head == b"0000":
+                pack_start = off + 4
+                break
+            if not re.fullmatch(rb"[0-9a-fA-F]{4}", head):
+                raise ValueError("bad pkt-line header %r" % head)
+            length = int(head.decode("ascii"), 16)
+            if length < 4 or length > PKT_MAX or off + length > n:
+                raise ValueError("bad pkt-line length %d" % length)
+            commands.append(body[off + 4:off + length])
+            off += length
+        if pack_start is None:
+            raise ValueError("missing flush in receive-pack body")
+        parsed = []
+        caps = ""
+        for i, raw in enumerate(commands):
+            text = raw.decode("utf-8", "replace").rstrip("\n")
+            if i == 0 and "\x00" in text:
+                text, caps = text.split("\x00", 1)
+            fields = text.split(" ")
+            if len(fields) != 3:
+                raise ValueError("bad push command %r" % text[:60])
+            old, new, ref = fields
+            if (not re.fullmatch(r"[0-9a-f]{40}", old)
+                    or not re.fullmatch(r"[0-9a-f]{40}", new)
+                    or not ref.startswith("refs/")):
+                raise ValueError("bad push command %r" % text[:60])
+            parsed.append((old, new, ref))
+        if not parsed:
+            raise ValueError("empty push command list")
+        pack = body[pack_start:]
+        sideband = "side-band-64k" in caps.split(" ")
+        if parsed and any(c[1] != ZERO_OID for c in parsed):
+            if not pack:
+                raise ValueError("push with updates carries no pack")
+            try:
+                new_objects, _ = read_pack(pack)
+            except ValueError as exc:
+                self._git_push_report([], parsed, "unpack error: %s" % exc,
+                                     sideband)
+                return
+            with STORE.lock:
+                for oid, obj in new_objects.items():
+                    if oid not in repo.objects:
+                        repo.objects[oid] = obj
+        results = []
+        with STORE.lock:
+            for old, new, ref in parsed:
+                current = repo.refs.get(ref)
+                if new == ZERO_OID:
+                    # Delete.
+                    if current is None:
+                        results.append((ref, False,
+                                        "remote ref does not exist"))
+                    elif old != ZERO_OID and old != current:
+                        results.append((ref, False, "non-fast-forward"))
+                    else:
+                        del repo.refs[ref]
+                        STORE.log_event("ref.delete",
+                                        {"repo": repo.full_name(),
+                                         "ref": ref})
+                        results.append((ref, True, ""))
+                    continue
+                if old == ZERO_OID:
+                    # Create.
+                    if current is not None:
+                        results.append((ref, False, "already exists"))
+                        continue
+                else:
+                    if current is None:
+                        results.append((ref, False,
+                                        "remote ref does not exist"))
+                        continue
+                    if current != old:
+                        results.append((ref, False, "non-fast-forward"))
+                        continue
+                obj = repo.objects.get(new)
+                if obj is None:
+                    results.append((ref, False, "object not found"))
+                    continue
+                if ref.startswith("refs/heads/") and obj[0] != "commit":
+                    results.append((ref, False, "not a commit"))
+                    continue
+                if (old != ZERO_OID and current is not None
+                        and not ref.startswith("refs/tags/")
+                        and not is_ancestor(repo.objects, old, new)):
+                    results.append((ref, False, "non-fast-forward"))
+                    continue
+                repo.refs[ref] = new
+                STORE.log_event("ref.update",
+                                {"repo": repo.full_name(), "ref": ref,
+                                 "old": old, "new": new})
+                results.append((ref, True, ""))
+        self._git_push_report(results, parsed, None, sideband)
+
+    def _git_push_report(self, results, parsed, unpack_error, sideband):
+        lines = []
+        if unpack_error is not None:
+            lines.append("unpack %s\n" % unpack_error)
+            for _, _, ref in parsed:
+                lines.append("ng %s %s\n" % (ref, "unpack failed"))
+        else:
+            lines.append("unpack ok\n")
+            for ref, ok, reason in results:
+                if ok:
+                    lines.append("ok %s\n" % ref)
+                else:
+                    lines.append("ng %s %s\n" % (ref, reason))
+        stream = b"".join(pkt_line(l) for l in lines) + pkt_flush()
+        if sideband:
+            body = self._git_sideband(stream, 1) + pkt_flush()
+        else:
+            body = stream + pkt_flush()
+        self._send(200, body, "application/x-git-receive-pack-result")
 
     # -- REST ------------------------------------------------------------
     def _rest(self, sub, method, query, head_only=False):
@@ -3050,12 +3503,26 @@ def _http_json(method, url, payload=None, timeout=10):
         return {}
 
 
+class ForgeServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def get_request(self):
+        sock, addr = super().get_request()
+        try:
+            # Kill Nagle/delayed-ACK ping-pong: the suite drives thousands of
+            # small request/response turns on keep-alive connections.
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+        return sock, addr
+
+
 def main():
     env_url = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
     if not env_url:
         sys.stderr.write("MAKEFUN_ENV_URL is not set\n")
         return 2
-    server = ThreadingHTTPServer(("0.0.0.0", 0), ForgeHandler)
+    server = ForgeServer(("0.0.0.0", 0), ForgeHandler)
     server.daemon_threads = True
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
