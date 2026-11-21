@@ -3018,3 +3018,79 @@ def _graphql_impl(self):
 
 ForgeHandler._mcp = _mcp_impl
 ForgeHandler._graphql = _graphql_impl
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint: trial lifecycle (RULES.txt, "The suite and the wire")
+#
+# 1. Bind an ephemeral port of our own (port 0; never 8080, the suite's).
+# 2. POST {"port": <port>} to $MAKEFUN_ENV_URL/register at once.
+# 3. Long-poll GET $MAKEFUN_ENV_URL/done until {"done": true}, then exit 0.
+# The forge itself is ForgeHandler above; this block only wires it into the
+# trial. Without it `python3 main.py` would define the server and exit.
+# ---------------------------------------------------------------------------
+
+def _http_json(method, url, payload=None, timeout=10):
+    data = None
+    headers = {"Content-Type": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers,
+                                 method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except Exception as exc:
+        if getattr(exc, "code", None) == 409:
+            return {"ok": False, "error": "already_registered"}
+        raise
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def main():
+    env_url = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
+    if not env_url:
+        sys.stderr.write("MAKEFUN_ENV_URL is not set\n")
+        return 2
+    server = ThreadingHTTPServer(("0.0.0.0", 0), ForgeHandler)
+    server.daemon_threads = True
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    # Register: the first register wins; retry briefly within the boot budget.
+    registered = False
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            body = _http_json("POST", env_url + "/register",
+                              {"port": port}, timeout=5)
+            if isinstance(body, dict) and body.get("error") == "already_registered":
+                registered = True
+            else:
+                registered = True
+            break
+        except Exception:
+            time.sleep(0.5)
+    if not registered:
+        sys.stderr.write("failed to register with env\n")
+        server.shutdown()
+        return 1
+    # Long-poll /done until the suite finishes, then exit 0.
+    while True:
+        try:
+            body = _http_json("GET", env_url + "/done", timeout=10)
+            if isinstance(body, dict) and body.get("done") is True:
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    server.shutdown()
+    server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
